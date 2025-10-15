@@ -1,0 +1,9 @@
+[run]
+omit =
+    main.py
+    setup.py
+    bcp_options.py
+    tests/*
+
+[report]
+# Add any report-specific settings here, if needed

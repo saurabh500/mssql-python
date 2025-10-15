@@ -1,0 +1,7 @@
+pytest
+pytest-cov
+pybind11
+coverage
+unittest-xml-reporting
+setuptools
+psutil
