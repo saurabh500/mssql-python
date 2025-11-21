@@ -47,6 +47,9 @@ from .type import (
 # Connection Objects
 from .db_connection import connect, Connection
 
+# Backend Configuration
+from .backend_config import set_backend, get_backend, reset_backend
+
 # Connection String Handling
 from .connection_string_parser import _ConnectionStringParser
 from .connection_string_builder import _ConnectionStringBuilder

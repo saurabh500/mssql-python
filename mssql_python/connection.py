@@ -44,6 +44,8 @@ from mssql_python.constants import ConstantsDDBC, GetInfoConstants
 from mssql_python.connection_string_parser import _ConnectionStringParser
 from mssql_python.connection_string_builder import _ConnectionStringBuilder
 from mssql_python.constants import _RESERVED_PARAMETERS
+from mssql_python.backend_config import get_backend
+from mssql_python.backend_adapter import BackendAdapter
 
 if TYPE_CHECKING:
     from mssql_python.row import Row
@@ -236,9 +238,19 @@ class Connection:
         if not PoolingManager.is_initialized():
             PoolingManager.enable()
         self._pooling = PoolingManager.is_enabled()
-        self._conn = ddbc_bindings.Connection(
-            self.connection_str, self._pooling, self._attrs_before
-        )
+        
+        # Create connection using appropriate backend (ODBC or Core)
+        backend = get_backend()
+        if backend == 'core':
+            # Core backend: BackendAdapter will map connection string to ClientContext
+            # Note: Core backend doesn't support pooling or attrs_before yet
+            self._conn = BackendAdapter.create_connection(self.connection_str)
+        else:
+            # ODBC backend: Use traditional ddbc_bindings with pooling
+            self._conn = ddbc_bindings.Connection(
+                self.connection_str, self._pooling, self._attrs_before
+            )
+        
         self.setautocommit(autocommit)
 
     def _construct_connection_string(
@@ -291,10 +303,13 @@ class Connection:
         # Step 4: Build connection string with merged params
         builder = _ConnectionStringBuilder(normalized_params)
         
-        # Step 5: Add Driver and APP parameters (always controlled by the driver)
-        # These maintain existing behavior: Driver is always hardcoded, APP is always MSSQL-Python
-        builder.add_param('Driver', 'ODBC Driver 18 for SQL Server')
-        builder.add_param('APP', 'MSSQL-Python')
+        # Step 5: Add Driver and APP parameters (only for ODBC backend)
+        # Core backend doesn't use these ODBC-specific parameters
+        backend = get_backend()
+        if backend == 'odbc':
+            # These maintain existing behavior: Driver is always hardcoded, APP is always MSSQL-Python
+            builder.add_param('Driver', 'ODBC Driver 18 for SQL Server')
+            builder.add_param('APP', 'MSSQL-Python')
         
         # Step 6: Build final string
         conn_str = builder.build()
