@@ -178,6 +178,9 @@ class Connection:
         self.connection_str = self._construct_connection_string(
             connection_str, **kwargs
         )
+        # Store original connection string for Core TDS backend (before ODBC modifications)
+        self._original_connection_str = connection_str if connection_str else ""
+        self._connection_kwargs = kwargs.copy()
         self._attrs_before = attrs_before or {}
 
         # Initialize encoding settings with defaults for Python 3
@@ -1462,6 +1465,34 @@ class Connection:
                 self._cursors.discard(cursor)
             except Exception:
                 pass  # Ignore errors during cleanup
+
+    def get_core_connection_string(self) -> str:
+        """
+        Get a Core TDS-compatible connection string without ODBC-specific parameters.
+        
+        This reconstructs the connection string from the original parameters
+        without adding Driver or APP keywords that are specific to ODBC.
+        Used by bulkcopy() to create temporary Core TDS connections.
+        
+        Returns:
+            str: Connection string suitable for Core TDS backend
+        """
+        # Parse original connection string
+        parser = _ConnectionStringParser(validate_keywords=True)
+        parsed_params = parser._parse(self._original_connection_str)
+        
+        # Normalize parameter names
+        normalized_params = _ConnectionStringParser._normalize_params(parsed_params, warn_rejected=False)
+        
+        # Merge kwargs (these override connection string values)
+        for key, value in self._connection_kwargs.items():
+            normalized_key = _ConnectionStringParser.normalize_key(key)
+            if normalized_key and normalized_key not in _RESERVED_PARAMETERS:
+                normalized_params[normalized_key] = str(value)
+        
+        # Build connection string without Driver/APP
+        builder = _ConnectionStringBuilder(normalized_params)
+        return builder.build()
 
     def __enter__(self) -> "Connection":
         """

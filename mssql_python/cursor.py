@@ -2561,6 +2561,133 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             logger.error( f"Error executing tables query: {e}")
             raise
 
+    def bulkcopy(
+        self,
+        table_name: str,
+        data_source,
+        **kwargs
+    ) -> dict:
+        """
+        Bulk copy data to SQL Server table using high-performance TDS bulk load protocol.
+
+        This method provides efficient bulk data loading similar to ADO.NET's SqlBulkCopy.
+        It's optimized for inserting large amounts of data with minimal overhead.
+
+        Args:
+            table_name: Name of the destination table (can include schema: "dbo.Users")
+            data_source: Iterator that yields tuples of row data (e.g., list, generator,
+                        DataFrame.itertuples())
+            **kwargs: Optional keyword arguments for bulk copy configuration
+
+        Keyword Args:
+            batch_size (int): Number of rows per batch (default: 1000)
+            timeout (int): Operation timeout in seconds (default: 30, 0 for no timeout)
+            column_mappings (List[Tuple[Union[str, int], str]]): Map source to destination columns
+                Format: [(source, destination), ...] where source is column name or index
+            keep_identity (bool): Preserve source identity values (default: False)
+            check_constraints (bool): Check constraints during insert (default: False)
+            table_lock (bool): Obtain table-level lock for better performance (default: False)
+            keep_nulls (bool): Preserve NULL values (default: False)
+            fire_triggers (bool): Fire INSERT triggers (default: False)
+            use_internal_transaction (bool): Use internal transaction (default: False)
+
+        Returns:
+            dict: Statistics about the bulk copy operation:
+                - rows_copied: Number of rows successfully copied
+                - batch_count: Number of batches processed
+                - elapsed_time: Total time in seconds
+                - rows_per_second: Throughput rate
+
+        Raises:
+            ProgrammingError: If the cursor is closed
+            InterfaceError: If the backend doesn't support bulk copy
+            RuntimeError: If the bulk copy operation fails
+
+        Examples:
+            >>> # Simple bulk copy
+            >>> cursor.bulkcopy('Users', [(1, 'Alice'), (2, 'Bob')])
+            {'rows_copied': 2, 'batch_count': 1, 'elapsed_time': 0.05, 'rows_per_second': 40.0}
+
+            >>> # With options
+            >>> cursor.bulkcopy(
+            ...     'Users',
+            ...     data_iterator,
+            ...     batch_size=5000,
+            ...     table_lock=True,
+            ...     keep_identity=True
+            ... )
+
+            >>> # With column mappings
+            >>> cursor.bulkcopy(
+            ...     'Users',
+            ...     data,
+            ...     column_mappings=[('src_id', 'UserID'), (1, 'UserName')]
+            ... )
+
+            >>> # Using DataFrame
+            >>> import pandas as pd
+            >>> df = pd.DataFrame({'id': [1, 2], 'name': ['Alice', 'Bob']})
+            >>> cursor.bulkcopy('Users', df.itertuples(index=False, name=None))
+
+        Note:
+            - This method requires the Core TDS backend (mssql_core_tds)
+            - For ODBC backend, use execute() with INSERT statements instead
+            - Column order in tuples must match destination table column order
+              (unless column_mappings is specified)
+            - Large batch_size values improve performance but use more memory
+        """
+        self._check_closed()
+
+        try:
+            # Import Core TDS module for temporary connection
+            try:
+                from mssql_core_tds import DdbcConnection as CoreDdbcConnection
+            except ImportError as import_err:
+                raise NotSupportedError(
+                    driver_error="bulkcopy() requires the Core TDS backend (mssql_core_tds module)",
+                    ddbc_error="Install with: pip install mssql-python[core]"
+                ) from import_err
+
+            # Import ClientContextBuilder to parse the connection string
+            from mssql_python.client_context_builder import ClientContextBuilder
+
+            # Get Core TDS-compatible connection string (without ODBC-specific parameters)
+            connection_string = self.connection.get_core_connection_string()
+
+            # Parse connection string into ClientContext for Core TDS
+            client_context = ClientContextBuilder.build_from_connection_string(connection_string)
+
+            # Create temporary Core TDS connection just for bulk copy
+            core_connection = None
+            try:
+                core_connection = CoreDdbcConnection(client_context)
+                core_cursor = core_connection.cursor()
+
+                # Call the Core TDS bulkcopy implementation
+                result = core_cursor.bulkcopy(table_name, data_source, kwargs)
+                
+                return result
+
+            finally:
+                # Always close the temporary Core TDS connection
+                if core_connection is not None:
+                    try:
+                        core_connection.close()
+                    except Exception:
+                        pass  # Ignore errors during cleanup
+
+        except NotSupportedError:
+            # Re-raise NotSupportedError as-is
+            raise
+        except AttributeError as e:
+            raise InterfaceError(
+                driver_error=f"bulkcopy() not available: {e}",
+                ddbc_error=""
+            ) from e
+        except Exception as e:
+            # Convert any other errors to RuntimeError with context
+            raise RuntimeError(f"Bulk copy failed: {e}") from e
+
     def callproc(
         self, procname: str, parameters: Optional[Sequence[Any]] = None
     ) -> Optional[Sequence[Any]]:
