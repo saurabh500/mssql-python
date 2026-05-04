@@ -42,13 +42,14 @@ class Row:
         # Apply output converters if available using pre-computed converter map
         if converter_map:
             self._values = self._apply_output_converters_optimized(values, converter_map)
-        elif (
-            cursor
-            and hasattr(cursor.connection, "_output_converters")
-            and cursor.connection._output_converters
-        ):
-            # Fallback to original method for backward compatibility
-            self._values = self._apply_output_converters(values, cursor)
+        elif cursor:
+            # Fast path: use getattr to avoid separate hasattr + dict truth check per row
+            converters = getattr(cursor.connection, "_output_converters", None)
+            if converters:
+                # Fallback to original method for backward compatibility
+                self._values = self._apply_output_converters(values, cursor)
+            else:
+                self._values = values
         else:
             self._values = values
 

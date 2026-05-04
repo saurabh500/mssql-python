@@ -2410,7 +2410,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         )
 
         # Capture any diagnostic messages after execution
-        if self.hstmt:
+        if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
             self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
 
         try:
@@ -2466,7 +2466,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 wchar_decoding.get("encoding", "utf-16le"),
             )
 
-            if self.hstmt:
+            if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
                 self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
 
             if ret == ddbc_sql_const.SQL_NO_DATA.value:
@@ -2532,7 +2532,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 wchar_decoding.get("encoding", "utf-16le"),
             )
 
-            if self.hstmt:
+            if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
                 self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
 
             # Update rownumber for the number of rows actually fetched
@@ -2593,7 +2593,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             # Check for errors
             check_error(ddbc_sql_const.SQL_HANDLE_STMT.value, self.hstmt, ret)
 
-            if self.hstmt:
+            if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
                 self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
 
             # Update rownumber for the number of rows actually fetched
@@ -2649,7 +2649,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
 
         batch = pyarrow.RecordBatch._import_from_c_capsule(*capsules)
 
-        if self.hstmt:
+        if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
             self.messages.extend(ddbc_bindings.DDBCSQLGetAllDiagRecords(self.hstmt))
 
         # Update rownumber for the number of rows actually fetched
