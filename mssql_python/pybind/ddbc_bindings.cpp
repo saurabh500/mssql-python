@@ -5823,25 +5823,212 @@ py::object FetchOneCRow_wrap(SqlHandlePtr StatementHandle, py::object column_map
 
     SQLSMALLINT numCols = SQLNumResultCols_wrap(StatementHandle);
 
-    // Allocate PyObject* array directly (like pyodbc)
+    // Allocate PyObject** array directly (like pyodbc)
     PyObject** apValues = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * numCols);
     if (!apValues) {
+        PyErr_NoMemory();
         throw py::error_already_set();
     }
 
-    // Fill values using SQLGetData — create Python objects directly into array
-    py::list tempRow;
-    ret = SQLGetData_wrap(StatementHandle, numCols, tempRow, charEncoding, wcharEncoding);
-    if (!SQL_SUCCEEDED(ret)) {
-        PyMem_Free(apValues);
-        ThrowStdException("SQLGetData failed in FetchOneCRow");
-    }
+    // Direct data extraction — bypass py::list entirely for common types
+    for (SQLSMALLINT i = 0; i < numCols; i++) {
+        SQLWCHAR colName[256];
+        SQLSMALLINT colNameLen;
+        SQLSMALLINT dataType;
+        SQLULEN columnSize;
+        SQLSMALLINT decimalDigits;
+        SQLSMALLINT nullable;
 
-    // Transfer ownership from py::list to apValues array
-    for (Py_ssize_t i = 0; i < numCols; i++) {
-        PyObject* val = PyList_GET_ITEM(tempRow.ptr(), i);
-        Py_INCREF(val);
-        apValues[i] = val;
+        ret = SQLDescribeCol_ptr(hStmt, i + 1, colName, 256, &colNameLen,
+                                 &dataType, &columnSize, &decimalDigits, &nullable);
+        if (!SQL_SUCCEEDED(ret)) {
+            apValues[i] = Py_None;
+            Py_INCREF(Py_None);
+            continue;
+        }
+
+        SQLLEN indicator = 0;
+
+        switch (dataType) {
+            case SQL_INTEGER: {
+                SQLINTEGER val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_LONG, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = PyLong_FromLong(val);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_SMALLINT:
+            case SQL_TINYINT: {
+                SQLSMALLINT val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_SHORT, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = PyLong_FromLong(val);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_BIGINT: {
+                SQLBIGINT val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_SBIGINT, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = PyLong_FromLongLong(val);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_REAL: {
+                SQLREAL val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_FLOAT, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = PyFloat_FromDouble((double)val);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_DOUBLE:
+            case SQL_FLOAT: {
+                SQLDOUBLE val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_DOUBLE, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = PyFloat_FromDouble(val);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_BIT: {
+                SQLCHAR val;
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_BIT, &val, 0, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA) {
+                    apValues[i] = val ? Py_True : Py_False;
+                    Py_INCREF(apValues[i]);
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            case SQL_WCHAR:
+            case SQL_WVARCHAR:
+            case SQL_WLONGVARCHAR: {
+                if (columnSize == SQL_NO_TOTAL || columnSize > 4000) {
+                    // LOB fallback — use py::list path
+                    goto fallback;
+                }
+                uint64_t bufSize = (columnSize + 1) * sizeof(SQLWCHAR);
+                std::vector<SQLWCHAR> buf(columnSize + 1);
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_WCHAR, buf.data(), bufSize, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA && indicator > 0) {
+                    uint64_t numChars = indicator / sizeof(SQLWCHAR);
+                    if (numChars <= columnSize) {
+                        std::wstring wstr = SQLWCHARToWString(buf.data(), numChars);
+                        std::string utf8 = WideToUTF8(wstr);
+                        apValues[i] = PyUnicode_FromStringAndSize(utf8.data(), utf8.size());
+                    } else {
+                        goto fallback;
+                    }
+                } else if (indicator == SQL_NULL_DATA || indicator < 0) {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                } else {
+                    // Empty string
+                    apValues[i] = PyUnicode_FromStringAndSize("", 0);
+                }
+                break;
+            }
+            case SQL_CHAR:
+            case SQL_VARCHAR:
+            case SQL_LONGVARCHAR: {
+                if (columnSize == SQL_NO_TOTAL || columnSize > 4000) {
+                    goto fallback;
+                }
+                uint64_t bufSize = columnSize * 4 + 1;
+                std::vector<SQLCHAR> buf(bufSize);
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_CHAR, buf.data(), bufSize, &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA && indicator > 0) {
+                    // Decode with effective encoding
+                    const std::string enc = GetEffectiveCharDecoding(charEncoding);
+                    if (enc == "utf-8") {
+                        apValues[i] = PyUnicode_FromStringAndSize(
+                            reinterpret_cast<char*>(buf.data()), (Py_ssize_t)indicator);
+                    } else {
+                        apValues[i] = PyUnicode_Decode(
+                            reinterpret_cast<char*>(buf.data()), (Py_ssize_t)indicator,
+                            enc.c_str(), "strict");
+                    }
+                    if (!apValues[i]) {
+                        // Decode error — use raw bytes
+                        PyErr_Clear();
+                        apValues[i] = PyBytes_FromStringAndSize(
+                            reinterpret_cast<char*>(buf.data()), (Py_ssize_t)indicator);
+                    }
+                } else if (indicator == SQL_NULL_DATA || indicator < 0) {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                } else {
+                    apValues[i] = PyUnicode_FromStringAndSize("", 0);
+                }
+                break;
+            }
+            case SQL_DECIMAL:
+            case SQL_NUMERIC: {
+                char numBuf[64] = {0};
+                ret = SQLGetData_ptr(hStmt, i + 1, SQL_C_CHAR, numBuf, sizeof(numBuf), &indicator);
+                if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA && indicator > 0) {
+                    // Use Python Decimal class
+                    PyObject* decStr = PyUnicode_FromStringAndSize(numBuf, (Py_ssize_t)indicator);
+                    if (decStr) {
+                        PyObject* decClass = PythonObjectCache::get_decimal_class().ptr();
+                        PyObject* args = PyTuple_Pack(1, decStr);
+                        apValues[i] = PyObject_Call(decClass, args, NULL);
+                        Py_DECREF(args);
+                        Py_DECREF(decStr);
+                        if (!apValues[i]) {
+                            PyErr_Clear();
+                            apValues[i] = Py_None; Py_INCREF(Py_None);
+                        }
+                    } else {
+                        apValues[i] = Py_None; Py_INCREF(Py_None);
+                    }
+                } else {
+                    apValues[i] = Py_None; Py_INCREF(Py_None);
+                }
+                break;
+            }
+            default:
+                goto fallback;
+        }
+        continue;
+
+    fallback:
+        // Fallback for complex types: use py::list approach for this column
+        {
+            py::list tempList;
+            // Re-get this one column via the general path
+            // For simplicity, get all remaining via old path
+            PyMem_Free(apValues);
+            py::list fullRow;
+            // We already fetched the row (SQLFetch succeeded), need to re-get all data
+            // Unfortunately we can't partially re-get. Fall back entirely.
+            ret = SQLGetData_wrap(StatementHandle, numCols, fullRow, charEncoding, wcharEncoding);
+            if (!SQL_SUCCEEDED(ret)) {
+                ThrowStdException("SQLGetData fallback failed in FetchOneCRow");
+            }
+            // Convert fullRow to CRow
+            PyObject** fallbackValues = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * numCols);
+            if (!fallbackValues) { PyErr_NoMemory(); throw py::error_already_set(); }
+            for (Py_ssize_t j = 0; j < numCols; j++) {
+                PyObject* val = PyList_GET_ITEM(fullRow.ptr(), j);
+                Py_INCREF(val);
+                fallbackValues[j] = val;
+            }
+            CRow* crow = CRow_New(column_map, numCols, fallbackValues);
+            if (!crow) throw py::error_already_set();
+            return py::reinterpret_steal<py::object>((PyObject*)crow);
+        }
     }
 
     // Create CRow (takes ownership of apValues)
