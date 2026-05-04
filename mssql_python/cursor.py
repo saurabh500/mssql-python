@@ -1549,12 +1549,19 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             }
             self._cached_converter_map = self._build_converter_map()
             self._uuid_str_indices = self._compute_uuid_str_indices()
+            # Cache decoding settings for fetch hot path — avoids lock + dict lookup per fetch call
+            char_dec = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value)
+            wchar_dec = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value)
+            self._cached_char_encoding = char_dec.get("encoding", "utf-8")
+            self._cached_wchar_encoding = wchar_dec.get("encoding", "utf-16le")
         else:
             self.rowcount = ddbc_bindings.DDBCSQLRowCount(self.hstmt)
             self._clear_rownumber()
             self._cached_column_map = None
             self._cached_converter_map = None
             self._uuid_str_indices = None
+            self._cached_char_encoding = None
+            self._cached_wchar_encoding = None
 
         self._reset_inputsizes()  # Reset input sizes after execution
         # Return self for method chaining
@@ -2453,8 +2460,14 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         """
         self._check_closed()  # Check if the cursor is closed
 
-        char_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value)
-        wchar_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value)
+        # Use cached decoding settings when available (set at execute() time).
+        # Falls back to connection lookup only if cache is empty.
+        char_enc = self._cached_char_encoding
+        wchar_enc = self._cached_wchar_encoding
+        if char_enc is None:
+            char_enc = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value).get("encoding", "utf-8")
+        if wchar_enc is None:
+            wchar_enc = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value).get("encoding", "utf-16le")
 
         # Fetch raw data
         row_data = []
@@ -2462,8 +2475,8 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             ret = ddbc_bindings.DDBCSQLFetchOne(
                 self.hstmt,
                 row_data,
-                char_decoding.get("encoding", "utf-8"),
-                wchar_decoding.get("encoding", "utf-16le"),
+                char_enc,
+                wchar_enc,
             )
 
             if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
@@ -2518,8 +2531,12 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if size <= 0:
             return []
 
-        char_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value)
-        wchar_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value)
+        char_enc = self._cached_char_encoding
+        wchar_enc = self._cached_wchar_encoding
+        if char_enc is None:
+            char_enc = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value).get("encoding", "utf-8")
+        if wchar_enc is None:
+            wchar_enc = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value).get("encoding", "utf-16le")
 
         # Fetch raw data
         rows_data = []
@@ -2528,8 +2545,8 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 self.hstmt,
                 rows_data,
                 size,
-                char_decoding.get("encoding", "utf-8"),
-                wchar_decoding.get("encoding", "utf-16le"),
+                char_enc,
+                wchar_enc,
             )
 
             if self.hstmt and ret == ddbc_sql_const.SQL_SUCCESS_WITH_INFO.value:
@@ -2577,8 +2594,12 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if not self._has_result_set and self.description:
             self._reset_rownumber()
 
-        char_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value)
-        wchar_decoding = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value)
+        char_enc = self._cached_char_encoding
+        wchar_enc = self._cached_wchar_encoding
+        if char_enc is None:
+            char_enc = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value).get("encoding", "utf-8")
+        if wchar_enc is None:
+            wchar_enc = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value).get("encoding", "utf-16le")
 
         # Fetch raw data
         rows_data = []
@@ -2586,8 +2607,8 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             ret = ddbc_bindings.DDBCSQLFetchAll(
                 self.hstmt,
                 rows_data,
-                char_decoding.get("encoding", "utf-8"),
-                wchar_decoding.get("encoding", "utf-16le"),
+                char_enc,
+                wchar_enc,
             )
 
             # Check for errors

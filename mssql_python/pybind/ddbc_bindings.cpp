@@ -1329,6 +1329,7 @@ void SqlHandle::markImplicitlyFreed() {
  * If you need destruction logs, use explicit close() methods instead.
  */
 void SqlHandle::free() {
+    clearColumnMetaCache();
     if (_handle && SQLFreeHandle_ptr) {
         // Check if Python is shutting down using centralized helper function
         bool pythonShuttingDown = is_python_finalizing();
@@ -1373,6 +1374,7 @@ void SqlHandle::close_cursor() {
         ThrowStdException("SQLFreeStmt function not loaded");
     }
     SQLRETURN ret = SQLFreeStmt_ptr(_handle, SQL_CLOSE);
+    clearColumnMetaCache();
     if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
         ThrowStdException("SQLFreeStmt(SQL_CLOSE) failed");
     }
@@ -1401,6 +1403,8 @@ SQLRETURN SQLResetStmt_wrap(SqlHandlePtr statementHandle) {
             rc = SQLSetStmtAttr_ptr(hStmt, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)1, 0);
         }
     }
+    // Clear column metadata cache since statement is being reset for new query
+    statementHandle->clearColumnMetaCache();
     return rc;
 }
 
@@ -4471,12 +4475,18 @@ SQLRETURN FetchMany_wrap(SqlHandlePtr StatementHandle, py::list& rows, int fetch
     // Retrieve column count
     SQLSMALLINT numCols = SQLNumResultCols_wrap(StatementHandle);
 
-    // Retrieve column metadata
+    // Use cached column metadata when available to avoid expensive SQLDescribeCol per fetch
     py::list columnNames;
-    ret = SQLDescribeCol_wrap(StatementHandle, columnNames);
-    if (!SQL_SUCCEEDED(ret)) {
-        LOG("FetchMany_wrap: Failed to get column descriptions - SQLRETURN=%d", ret);
-        return ret;
+    if (StatementHandle->hasColumnMetaCache && StatementHandle->cachedNumCols == numCols) {
+        columnNames = StatementHandle->getColumnMetaCache();
+    } else {
+        ret = SQLDescribeCol_wrap(StatementHandle, columnNames);
+        if (!SQL_SUCCEEDED(ret)) {
+            LOG("FetchMany_wrap: Failed to get column descriptions - SQLRETURN=%d", ret);
+            return ret;
+        }
+        // Cache for subsequent fetch calls
+        StatementHandle->setColumnMetaCache(columnNames, numCols);
     }
 
     std::vector<SQLUSMALLINT> lobColumns;
@@ -5616,12 +5626,17 @@ SQLRETURN FetchAll_wrap(SqlHandlePtr StatementHandle, py::list& rows,
     // Retrieve column count
     SQLSMALLINT numCols = SQLNumResultCols_wrap(StatementHandle);
 
-    // Retrieve column metadata
+    // Use cached column metadata when available
     py::list columnNames;
-    ret = SQLDescribeCol_wrap(StatementHandle, columnNames);
-    if (!SQL_SUCCEEDED(ret)) {
-        LOG("FetchAll_wrap: Failed to get column descriptions - SQLRETURN=%d", ret);
-        return ret;
+    if (StatementHandle->hasColumnMetaCache && StatementHandle->cachedNumCols == numCols) {
+        columnNames = StatementHandle->getColumnMetaCache();
+    } else {
+        ret = SQLDescribeCol_wrap(StatementHandle, columnNames);
+        if (!SQL_SUCCEEDED(ret)) {
+            LOG("FetchAll_wrap: Failed to get column descriptions - SQLRETURN=%d", ret);
+            return ret;
+        }
+        StatementHandle->setColumnMetaCache(columnNames, numCols);
     }
 
     std::vector<SQLUSMALLINT> lobColumns;

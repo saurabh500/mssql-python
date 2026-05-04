@@ -369,6 +369,11 @@ class DriverLoader {
 // SqlHandle
 //
 // RAII wrapper around ODBC handles (ENV, DBC, STMT).
+// Forward declaration for use in SqlHandle
+static inline bool is_python_finalizing_check() {
+    return Py_IsInitialized() == 0;
+}
+
 // Use `std::shared_ptr<SqlHandle>` (alias: SqlHandlePtr) for shared ownership.
 //-------------------------------------------------------------------------------------------------
 class SqlHandle {
@@ -394,6 +399,37 @@ class SqlHandle {
     // Current usage: Connection::disconnect() marks all tracked STMT handles
     // before freeing the DBC handle.
     void markImplicitlyFreed();
+
+    // Column metadata cache for fetch hot path.
+    // We store the py::list as a PyObject* to avoid visibility attribute conflicts.
+    // Populated by first SQLDescribeCol call, cleared on close_cursor/free.
+    PyObject* cachedColumnMetaRaw = nullptr;
+    bool hasColumnMetaCache = false;
+    SQLSMALLINT cachedNumCols = 0;
+
+    void setColumnMetaCache(py::list& meta, SQLSMALLINT numCols) {
+        clearColumnMetaCache();
+        cachedColumnMetaRaw = meta.ptr();
+        Py_XINCREF(cachedColumnMetaRaw);
+        hasColumnMetaCache = true;
+        cachedNumCols = numCols;
+    }
+
+    py::list getColumnMetaCache() {
+        return py::reinterpret_borrow<py::list>(cachedColumnMetaRaw);
+    }
+
+    void clearColumnMetaCache() {
+        if (cachedColumnMetaRaw) {
+            // Only decref if Python is still alive
+            if (Py_IsInitialized()) {
+                Py_XDECREF(cachedColumnMetaRaw);
+            }
+            cachedColumnMetaRaw = nullptr;
+        }
+        hasColumnMetaCache = false;
+        cachedNumCols = 0;
+    }
 
   private:
     SQLSMALLINT _type;
