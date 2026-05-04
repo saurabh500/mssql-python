@@ -5830,21 +5830,48 @@ py::object FetchOneCRow_wrap(SqlHandlePtr StatementHandle, py::object column_map
         throw py::error_already_set();
     }
 
+    // Get or build column metadata cache (avoids per-column SQLDescribeCol calls)
+    py::list columnMeta;
+    if (StatementHandle->hasColumnMetaCache && StatementHandle->cachedNumCols == numCols) {
+        columnMeta = StatementHandle->getColumnMetaCache();
+    } else {
+        SQLRETURN descRet = SQLDescribeCol_wrap(StatementHandle, columnMeta);
+        if (SQL_SUCCEEDED(descRet)) {
+            StatementHandle->setColumnMetaCache(columnMeta, numCols);
+        }
+    }
+
+    // Pre-extract column types from cached metadata (one Python dict access per col, not ODBC call)
+    struct ColInfo { SQLSMALLINT dataType; SQLULEN columnSize; };
+    std::vector<ColInfo> colInfos(numCols);
+    bool hasCachedMeta = (py::len(columnMeta) == numCols);
+    if (hasCachedMeta) {
+        for (SQLSMALLINT i = 0; i < numCols; i++) {
+            auto meta = columnMeta[i].cast<py::dict>();
+            colInfos[i].dataType = meta["DataType"].cast<SQLSMALLINT>();
+            colInfos[i].columnSize = meta["ColumnSize"].cast<SQLULEN>();
+        }
+    }
+
     // Direct data extraction — bypass py::list entirely for common types
     for (SQLSMALLINT i = 0; i < numCols; i++) {
-        SQLWCHAR colName[256];
-        SQLSMALLINT colNameLen;
         SQLSMALLINT dataType;
         SQLULEN columnSize;
-        SQLSMALLINT decimalDigits;
-        SQLSMALLINT nullable;
 
-        ret = SQLDescribeCol_ptr(hStmt, i + 1, colName, 256, &colNameLen,
-                                 &dataType, &columnSize, &decimalDigits, &nullable);
-        if (!SQL_SUCCEEDED(ret)) {
-            apValues[i] = Py_None;
-            Py_INCREF(Py_None);
-            continue;
+        if (hasCachedMeta) {
+            dataType = colInfos[i].dataType;
+            columnSize = colInfos[i].columnSize;
+        } else {
+            // Fallback: per-column SQLDescribeCol (shouldn't normally hit this)
+            SQLWCHAR colName[256];
+            SQLSMALLINT colNameLen, decimalDigits, nullable;
+            ret = SQLDescribeCol_ptr(hStmt, i + 1, colName, 256, &colNameLen,
+                                     &dataType, &columnSize, &decimalDigits, &nullable);
+            if (!SQL_SUCCEEDED(ret)) {
+                apValues[i] = Py_None;
+                Py_INCREF(Py_None);
+                continue;
+            }
         }
 
         SQLLEN indicator = 0;
