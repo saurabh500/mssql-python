@@ -5,6 +5,7 @@
 // agnostic will be
 //             taken up in beta release
 #include "ddbc_bindings.h"
+#include "crow.h"
 #include "connection/connection.h"
 #include "connection/connection_pool.h"
 #include "logger_bridge.hpp"
@@ -5796,6 +5797,100 @@ SQLRETURN FetchOne_wrap(SqlHandlePtr StatementHandle, py::list& row,
     return ret;
 }
 
+// FetchOneCRow - Like FetchOne_wrap but returns a CRow directly (zero-copy hot path).
+// Returns: py::object (CRow on success, py::none() on SQL_NO_DATA, throws on error)
+py::object FetchOneCRow_wrap(SqlHandlePtr StatementHandle, py::object column_map_obj,
+                             const std::string& charEncoding = "utf-8",
+                             const std::string& wcharEncoding = "utf-16le") {
+    SQLHSTMT hStmt = StatementHandle->get();
+    PyObject* column_map = column_map_obj.ptr();
+
+    // Unbind columns from previous operations
+    SQLFreeStmt_ptr(hStmt, SQL_UNBIND);
+
+    SQLRETURN ret;
+    {
+        py::gil_scoped_release release;
+        ret = SQLFetch_ptr(hStmt);
+    }
+
+    if (ret == SQL_NO_DATA) {
+        return py::none();
+    }
+    if (!SQL_SUCCEEDED(ret)) {
+        ThrowStdException("SQLFetch failed in FetchOneCRow");
+    }
+
+    SQLSMALLINT numCols = SQLNumResultCols_wrap(StatementHandle);
+
+    // Allocate PyObject* array directly (like pyodbc)
+    PyObject** apValues = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * numCols);
+    if (!apValues) {
+        throw py::error_already_set();
+    }
+
+    // Fill values using SQLGetData — create Python objects directly into array
+    py::list tempRow;
+    ret = SQLGetData_wrap(StatementHandle, numCols, tempRow, charEncoding, wcharEncoding);
+    if (!SQL_SUCCEEDED(ret)) {
+        PyMem_Free(apValues);
+        ThrowStdException("SQLGetData failed in FetchOneCRow");
+    }
+
+    // Transfer ownership from py::list to apValues array
+    for (Py_ssize_t i = 0; i < numCols; i++) {
+        PyObject* val = PyList_GET_ITEM(tempRow.ptr(), i);
+        Py_INCREF(val);
+        apValues[i] = val;
+    }
+
+    // Create CRow (takes ownership of apValues)
+    CRow* crow = CRow_New(column_map, numCols, apValues);
+    if (!crow) {
+        throw py::error_already_set();
+    }
+
+    return py::reinterpret_steal<py::object>((PyObject*)crow);
+}
+
+// FetchManyCRow - Fetch multiple rows as list of CRow objects
+py::list FetchManyCRow_wrap(SqlHandlePtr StatementHandle, int fetchSize, py::object column_map_obj,
+                            const std::string& charEncoding = "utf-8",
+                            const std::string& wcharEncoding = "utf-16le") {
+    PyObject* column_map = column_map_obj.ptr();
+    py::list results;
+
+    // Use existing FetchMany infrastructure but convert to CRow
+    py::list rows;
+    SQLRETURN ret = FetchMany_wrap(StatementHandle, rows, fetchSize, charEncoding, wcharEncoding);
+
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA) {
+        ThrowStdException("FetchMany failed in FetchManyCRow");
+    }
+
+    // Convert each py::list row to CRow
+    Py_ssize_t numRows = PyList_GET_SIZE(rows.ptr());
+    for (Py_ssize_t r = 0; r < numRows; r++) {
+        PyObject* rowList = PyList_GET_ITEM(rows.ptr(), r);
+        Py_ssize_t numCols = PyList_GET_SIZE(rowList);
+
+        PyObject** apValues = (PyObject**)PyMem_Malloc(sizeof(PyObject*) * numCols);
+        if (!apValues) throw py::error_already_set();
+
+        for (Py_ssize_t i = 0; i < numCols; i++) {
+            PyObject* val = PyList_GET_ITEM(rowList, i);
+            Py_INCREF(val);
+            apValues[i] = val;
+        }
+
+        CRow* crow = CRow_New(column_map, numCols, apValues);
+        if (!crow) throw py::error_already_set();
+        results.append(py::reinterpret_steal<py::object>((PyObject*)crow));
+    }
+
+    return results;
+}
+
 // Wrap SQLMoreResults
 SQLRETURN SQLMoreResults_wrap(SqlHandlePtr StatementHandle) {
     LOG("SQLMoreResults_wrap: Check for more results");
@@ -5867,6 +5962,9 @@ void DDBCSetDecimalSeparator(const std::string& separator) {
 // Functions/data to be exposed to Python as a part of ddbc_bindings module
 PYBIND11_MODULE(ddbc_bindings, m) {
     m.doc() = "msodbcsql driver api bindings for Python";
+
+    // Initialize C-level Row type
+    CRow_Init(m.ptr());
 
     PythonObjectCache::initialize();
 
@@ -5945,6 +6043,12 @@ PYBIND11_MODULE(ddbc_bindings, m) {
     m.def("DDBCSQLFetchOne", &FetchOne_wrap, "Fetch one row from the result set",
           py::arg("StatementHandle"), py::arg("row"), py::arg("charEncoding") = "utf-8",
           py::arg("wcharEncoding") = "utf-16le");
+    m.def("DDBCSQLFetchOneCRow", &FetchOneCRow_wrap, "Fetch one row as CRow (fast path)",
+          py::arg("StatementHandle"), py::arg("column_map"),
+          py::arg("charEncoding") = "utf-8", py::arg("wcharEncoding") = "utf-16le");
+    m.def("DDBCSQLFetchManyCRow", &FetchManyCRow_wrap, "Fetch many rows as CRow list (fast path)",
+          py::arg("StatementHandle"), py::arg("fetchSize"), py::arg("column_map"),
+          py::arg("charEncoding") = "utf-8", py::arg("wcharEncoding") = "utf-16le");
     m.def("DDBCSQLFetchMany", &FetchMany_wrap, py::arg("StatementHandle"), py::arg("rows"),
           py::arg("fetchSize"), py::arg("charEncoding") = "utf-8",
           py::arg("wcharEncoding") = "utf-16le", "Fetch many rows from the result set");

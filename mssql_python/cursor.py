@@ -2451,25 +2451,56 @@ class Cursor:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             # Reset input sizes after execution
             self._reset_inputsizes()
 
-    def fetchone(self) -> Union[None, Row]:
+    def fetchone(self):
         """
         Fetch the next row of a query result set.
 
         Returns:
-            Single Row object or None if no more data is available.
+            Single Row/CRow object or None if no more data is available.
         """
         self._check_closed()  # Check if the cursor is closed
 
         # Use cached decoding settings when available (set at execute() time).
-        # Falls back to connection lookup only if cache is empty.
-        char_enc = self._cached_char_encoding
-        wchar_enc = self._cached_wchar_encoding
-        if char_enc is None:
-            char_enc = self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value).get("encoding", "utf-8")
-        if wchar_enc is None:
-            wchar_enc = self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value).get("encoding", "utf-16le")
+        char_enc = self._cached_char_encoding or self._get_decoding_settings(ddbc_sql_const.SQL_CHAR.value).get("encoding", "utf-8")
+        wchar_enc = self._cached_wchar_encoding or self._get_decoding_settings(ddbc_sql_const.SQL_WCHAR.value).get("encoding", "utf-16le")
 
-        # Fetch raw data
+        # Fast path: use CRow when no output converters or UUID conversion needed
+        column_map, converter_map = self._get_column_and_converter_maps()
+        use_crow = (
+            not converter_map
+            and not self._uuid_str_indices
+            and not getattr(self._connection, '_output_converters', None)
+            and hasattr(ddbc_bindings, 'DDBCSQLFetchOneCRow')
+        )
+
+        if use_crow:
+            try:
+                # column_map is a Python dict — pass it directly to C
+                result = ddbc_bindings.DDBCSQLFetchOneCRow(
+                    self.hstmt,
+                    column_map,
+                    char_enc,
+                    wchar_enc,
+                )
+
+                if result is None:
+                    if self._next_row_index == 0 and self.description is not None:
+                        self.rowcount = 0
+                    return None
+
+                # Update internal position
+                if self._skip_increment_for_next_fetch:
+                    self._skip_increment_for_next_fetch = False
+                    self._next_row_index += 1
+                else:
+                    self._increment_rownumber()
+                self.rowcount = self._next_row_index
+                return result
+            except Exception:
+                # Fall back to legacy path on any error
+                pass
+
+        # Legacy path with Python Row
         row_data = []
         try:
             ret = ddbc_bindings.DDBCSQLFetchOne(
